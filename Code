@@ -1,0 +1,1103 @@
+"""
+=============================================================================
+FLOOD RISK ASSESSMENT PIPELINE — FULL SRI LANKA
+=============================================================================
+Runs the complete GIS workflow for the entire island of Sri Lanka,
+clipping the DEM to the national boundary shapefile instead of a fixed
+bounding box.
+
+PIPELINE STAGES:
+  Stage 0 — Configuration
+  Stage 1 — Data Loading & ROI Clipping (via SL boundary shapefile)
+  Stage 2 — DEM Pre-processing (fill sinks, resolve flats)
+  Stage 3 — Watershed Delineation (flow direction, accumulation, basin)
+  Stage 4 — Flood Hazard Mapping (inundation depth classification)
+  Stage 5 — Vulnerability Analysis (population + building exposure)
+  Stage 6 — Flood Risk Mapping (weighted overlay)
+  Stage 7 — Export & Visualization
+
+FIX (v2):
+  load_and_clip_dem() — removed boundary.dissolve() which triggered a
+  Shapely TopologyException on invalid coastline vertices near Mannar
+  (79.89, 8.95).  Instead, individual feature geometries are passed
+  directly to rio_mask() so GDAL handles the masking internally —
+  no Shapely union required.
+
+INSTALLATION:
+  pip install rasterio numpy pysheds geopandas rasterstats matplotlib scipy fiona
+  # If GDAL is needed first:
+  # conda install -c conda-forge gdal rasterio pysheds geopandas
+=============================================================================
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IMPORTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+import os
+os.environ["NUMBA_DISABLE_JIT"] = "1"   # Disable numba JIT to avoid cache issues
+
+import warnings
+import numpy as np
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.colors import BoundaryNorm, ListedColormap
+
+import rasterio
+from rasterio import features
+from rasterio.mask import mask as rio_mask
+
+from pysheds.grid import Grid
+
+from rasterstats import zonal_stats
+
+from shapely.geometry import mapping
+
+warnings.filterwarnings("ignore")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 0 — CONFIGURATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+CFG = {
+    # ── Inputs ────────────────────────────────────────────────────────────────
+    "dem_path":           "F:/GEO AI/Flood Hazard Analyis/DATA_1/DATA_1/DEM/GEO_ANA/sl_dem.tif",
+
+    # National boundary shapefile used to clip DEM to the full island.
+    # Must be a polygon shapefile of Sri Lanka's coastline / admin boundary.
+    # Common sources: Survey Dept. Sri Lanka.
+    "sl_boundary_path":   "F:/GEO AI/Flood Hazard Analyis/SL Boundary/SLB.shp",
+    "gn_division_path":   "F:/GEO AI/Flood Hazard Analyis/DATA_1/DATA_1/GND/GND.shp",
+    "population_path":    "F:/GEO AI/Flood Hazard Analyis/Population/Sri_Lanka_Population.shp",
+    "buildings_path":     "F:/GEO AI/Flood Hazard Analyis/DATA_1/DATA_1/hotosm_lka_buildings_polygons_shp/hotosm_lka_buildings_polygons_shp.shp",
+    "roads_path":         "F:/GEO AI/Flood Hazard Analyis/DATA_1/DATA_1/Roads.shp",
+
+    # ── Projection ────────────────────────────────────────────────────────────
+    # WGS84 geographic.  Switch to EPSG:5235 (Sri Lanka 1999) for metre-based
+    # area calculations (recommended for production runs).
+    "target_crs":         "EPSG:4326",
+
+    # ── Study Area ────────────────────────────────────────────────────────────
+    # Full Sri Lanka — clipping is driven by the sl_boundary_path shapefile.
+    # Individual feature geometries are passed directly to rio_mask so that
+    # GDAL handles the union internally (avoids Shapely topology errors on
+    # coastline shapefiles with minor self-intersections).
+    # Island approximate extent: lon 79.65–81.88, lat 5.92–9.83.
+
+    # ── Flood Scenario ────────────────────────────────────────────────────────
+    # Water surface elevation in metres above sea level.
+    # Increase for higher return-period events (e.g. 25 m for extreme scenario).
+    "flood_level_m":      12.0,
+
+    # ── Stream extraction threshold (upstream cells) ──────────────────────────
+    # Lower  → denser river network.
+    # Higher → only major rivers shown.
+    # 1000 is a reasonable starting point for island-wide analysis.
+    "stream_threshold":   1000,
+
+    # ── Outputs ───────────────────────────────────────────────────────────────
+    "out_dir":            "F:/GEO AI/Flood Hazard Analyis/outputs",
+}
+
+os.makedirs(CFG["out_dir"], exist_ok=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONSTANTS — Hazard / Vulnerability / Risk classification
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Flood Hazard (Sri Lanka DMC thresholds) ───────────────────────────────────
+HAZARD_BINS   = [0, 0.5, 1.5, 3.0, np.inf]
+HAZARD_LABELS = ["Very Low", "Low", "Moderate", "High"]
+HAZARD_COLORS = ["#FFFF99", "#FFC14D", "#66BB66", "#CC0000"]
+
+# ── Vulnerability ─────────────────────────────────────────────────────────────
+VULN_BINS   = [0, 10, 25, 50, 100]
+VULN_LABELS = ["Very Low", "Low", "Moderate", "High"]
+VULN_COLORS = ["#006600", "#33AA33", "#FFA500", "#CC0000"]
+
+# ── Flood Risk ────────────────────────────────────────────────────────────────
+RISK_COLORS = ["#4DB8FF", "#66CC66", "#FFFF00", "#FFA500", "#CC0000"]
+RISK_LABELS = ["Very Low", "Low", "Moderate", "High", "Very High"]
+
+# ── Weighted Overlay weights ──────────────────────────────────────────────────
+HAZARD_WEIGHT = 0.60
+VULN_WEIGHT   = 0.40
+
+# ── D8 direction map ──────────────────────────────────────────────────────────
+DIRMAP = (64, 128, 1, 2, 4, 8, 16, 32)   # N, NE, E, SE, S, SW, W, NW
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 1 — DATA LOADING & ROI CLIPPING
+# ─────────────────────────────────────────────────────────────────────────────
+"""
+WHAT:  Load the DEM and clip it to the Sri Lanka national boundary polygon.
+       All vector layers are also loaded and reprojected to the target CRS.
+
+FIX:   boundary.dissolve() removed — it caused a Shapely TopologyException
+       (side location conflict at 79.89, 8.95) on coastline shapefiles that
+       contain minor self-intersections.
+
+       Solution: pass each feature geometry individually to rio_mask().
+       rasterio forwards the list to GDAL which handles the masking union
+       internally and is tolerant of minor topology issues.
+
+LIBS:  rasterio.mask  — clips raster to a list of polygon geometries (GDAL)
+       geopandas       — loads / reprojects vector shapefiles
+"""
+
+
+def load_and_clip_dem(cfg: dict) -> tuple:
+    """
+    Load the DEM and clip it to the Sri Lanka boundary shapefile.
+
+    Individual feature geometries are passed directly to rio_mask — no
+    dissolve or Shapely union is performed, avoiding TopologyExceptions
+    on coastline shapefiles with minor self-intersections.
+
+    Parameters
+    ----------
+    cfg : dict  Pipeline configuration dictionary.
+
+    Returns
+    -------
+    dem_arr   : np.ndarray   2-D elevation array (float32).
+    transform : Affine       Affine geo-transform of the clipped DEM.
+    crs       : CRS          Coordinate reference system.
+    nodata    : float        NoData sentinel value.
+    meta      : dict         Full rasterio metadata for writing derived rasters.
+    """
+    # ── Load boundary shapefile ───────────────────────────────────────────────
+    if not os.path.exists(cfg["sl_boundary_path"]):
+        raise FileNotFoundError(
+            f"Sri Lanka boundary shapefile not found:\n  {cfg['sl_boundary_path']}\n"
+            "Download from GADM (https://gadm.org/download_country.html) "
+            "and update 'sl_boundary_path' in CFG."
+        )
+
+    boundary = gpd.read_file(cfg["sl_boundary_path"])
+
+    # Reproject boundary to match the DEM's CRS before masking
+    with rasterio.open(cfg["dem_path"]) as src:
+        dem_crs = src.crs
+
+    if boundary.crs is None:
+        boundary = boundary.set_crs("EPSG:4326")
+    if str(boundary.crs) != str(dem_crs):
+        boundary = boundary.to_crs(dem_crs)
+
+    # ── Build geometry list — NO dissolve, NO Shapely union ──────────────────
+    # Pass each feature geometry individually to rio_mask.
+    # GDAL merges them into a single raster mask internally, completely
+    # bypassing Shapely's topology validation that triggered the error:
+    #   "TopologyException: side location conflict at 79.8897, 8.9487"
+    # This is the standard approach for clipping when the boundary shapefile
+    # contains minor coastline self-intersections.
+    clip_geoms = [
+        mapping(geom)
+        for geom in boundary.geometry
+        if geom is not None and not geom.is_empty
+    ]
+
+    if not clip_geoms:
+        raise ValueError(
+            "No valid geometries found in the boundary shapefile. "
+            "Check that the file contains polygon features."
+        )
+
+    print(f"[Stage 1] Clipping DEM using {len(clip_geoms)} boundary feature(s) ...")
+
+    # ── Clip DEM with rasterio / GDAL ────────────────────────────────────────
+    with rasterio.open(cfg["dem_path"]) as src:
+        nodata_in = src.nodata if src.nodata is not None else -9999
+
+        dem_arr, transform = rio_mask(
+            src,
+            clip_geoms,         # list of individual geometries — no union needed
+            crop=True,          # crop output extent to geometry bounding box
+            nodata=nodata_in,
+            filled=True,
+            all_touched=False   # only cells whose centre falls inside SL
+        )
+        meta = src.meta.copy()
+
+    dem_arr = dem_arr[0].astype(np.float32)
+    nodata  = float(nodata_in)
+
+    # Replace NoData sentinel with NaN for safe arithmetic downstream
+    dem_arr[dem_arr == nodata] = np.nan
+
+    meta.update({
+        "driver":    "GTiff",
+        "height":    dem_arr.shape[0],
+        "width":     dem_arr.shape[1],
+        "count":     1,
+        "dtype":     "float32",
+        "transform": transform,
+        "crs":       dem_crs,
+        "nodata":    -9999,
+    })
+
+    print(f"[Stage 1] DEM clipped to Sri Lanka boundary")
+    print(f"          Shape     : {dem_arr.shape}  "
+          f"({dem_arr.shape[1]} cols × {dem_arr.shape[0]} rows)")
+    print(f"          Elevation : {np.nanmin(dem_arr):.1f} – "
+          f"{np.nanmax(dem_arr):.1f} m")
+
+    return dem_arr, transform, meta["crs"], nodata, meta
+
+
+def load_vector_layers(cfg: dict) -> dict:
+    """
+    Load all vector shapefiles and reproject each to the target CRS.
+
+    Returns
+    -------
+    layers : dict  {layer_name: GeoDataFrame}
+    """
+    layers = {}
+    layer_keys = {
+        "gn_division_path": "gn_division",
+        "population_path":  "population",
+        "buildings_path":   "buildings",
+        "roads_path":       "roads",
+    }
+
+    for cfg_key, layer_name in layer_keys.items():
+        path = cfg.get(cfg_key, "")
+        if path and os.path.exists(path):
+            gdf = gpd.read_file(path)
+            if gdf.crs and str(gdf.crs) != cfg["target_crs"]:
+                gdf = gdf.to_crs(cfg["target_crs"])
+            layers[layer_name] = gdf
+            print(f"[Stage 1] Loaded '{layer_name}': {len(gdf):,} features")
+        else:
+            print(f"[Stage 1] WARNING — '{layer_name}' not found at: {path}")
+
+    return layers
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 2 — DEM PRE-PROCESSING
+# ─────────────────────────────────────────────────────────────────────────────
+"""
+WHAT:  Hydrologically condition the DEM:
+         1. Fill pits        — isolated single-cell sinks.
+         2. Fill depressions — multi-cell closed basins.
+         3. Resolve flats    — plateau areas with ambiguous flow direction.
+
+WHY:   Raw DEMs contain spurious depressions that interrupt D8 flow routing,
+       producing disconnected or incorrect watersheds.
+
+LIBS:  pysheds.Grid
+REPLACES: QGIS GRASS r.watershed fill step / ArcGIS Spatial Analyst → Fill
+"""
+
+
+def preprocess_dem(dem_path: str, cfg: dict) -> tuple:
+    """
+    Load the clipped DEM into pysheds and return a conditioned grid.
+
+    Parameters
+    ----------
+    dem_path : str   Path to the clipped DEM GeoTIFF (written in Stage 1).
+    cfg      : dict  Pipeline config.
+
+    Returns
+    -------
+    grid        : pysheds.Grid   Hydrologically conditioned grid object.
+    conditioned : Grid raster    Pit/depression-filled DEM raster.
+    """
+    grid = Grid.from_raster(dem_path)
+    dem  = grid.read_raster(dem_path)
+
+    print("[Stage 2] Filling pits ...")
+    pit_filled = grid.fill_pits(dem)
+
+    print("[Stage 2] Filling depressions ...")
+    flooded = grid.fill_depressions(pit_filled)
+
+    print("[Stage 2] Resolving flats ...")
+    conditioned = grid.resolve_flats(flooded)
+
+    print("[Stage 2] DEM conditioning complete.")
+    return grid, conditioned
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 3 — WATERSHED DELINEATION
+# ─────────────────────────────────────────────────────────────────────────────
+"""
+WHAT:  Derive hydrological layers from the conditioned DEM:
+         a) D8 Flow Direction  — drainage direction for every cell.
+         b) Flow Accumulation  — upstream contributing area per cell.
+         c) Stream Network     — river channels above accumulation threshold.
+
+NOTE:  For island-wide analysis grid.clip_to(catch) is skipped so the full
+       SL domain is preserved. Individual river basins can be delineated in
+       a second pass by supplying specific pour points.
+
+LIBS:  pysheds.Grid
+REPLACES: QGIS GRASS r.watershed / ArcGIS Hydrology toolset
+"""
+
+
+def delineate_watershed(grid: Grid, conditioned_dem, cfg: dict) -> dict:
+    """
+    Compute flow direction, accumulation, and stream network for Sri Lanka.
+
+    Parameters
+    ----------
+    grid           : pysheds.Grid   Conditioned grid from Stage 2.
+    conditioned_dem                 Pit/depression-filled DEM raster.
+    cfg            : dict           Pipeline config.
+
+    Returns
+    -------
+    results : dict  Keys: 'fdir', 'acc', 'streams'
+    """
+    print("[Stage 3] Computing D8 flow direction ...")
+    fdir = grid.flowdir(conditioned_dem, dirmap=DIRMAP)
+    print("[Stage 3] Flow direction computed.")
+
+    print("[Stage 3] Computing flow accumulation ...")
+    acc = grid.accumulation(fdir, dirmap=DIRMAP)
+    print(f"[Stage 3] Flow accumulation done — "
+          f"max upstream cells: {int(acc.max()):,}")
+
+    threshold = cfg.get("stream_threshold", 1000)
+    streams   = acc > threshold
+    print(f"[Stage 3] Stream network extracted "
+          f"(threshold = {threshold:,} cells).")
+
+    # Save flow accumulation as GeoTIFF for QA / visualisation
+    acc_path = os.path.join(cfg["out_dir"], "flow_accumulation.tif")
+    grid.to_raster(acc, acc_path)
+    print(f"[Stage 3] Flow accumulation raster saved: {acc_path}")
+
+    return {"fdir": fdir, "acc": acc, "streams": streams}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 4 — FLOOD HAZARD MAPPING
+# ─────────────────────────────────────────────────────────────────────────────
+"""
+WHAT:  Produce a flood inundation depth raster and classify it into four
+       hazard levels using the Sri Lanka DMC depth thresholds.
+
+APPROACH — Bathtub / DEM-difference method:
+  Inundation depth = flood_level_m − DEM elevation  (where DEM < flood level)
+
+HAZARD CLASSES:
+  1 — Very Low  : 0   – 0.5 m
+  2 — Low       : 0.5 – 1.5 m
+  3 — Moderate  : 1.5 – 3.0 m
+  4 — High      : > 3.0 m
+
+REPLACES: ArcGIS Model Builder flood chain (Topo→Raster, Fill, Int, Extract)
+"""
+
+
+def generate_flood_hazard_map(dem_arr: np.ndarray, meta: dict, cfg: dict) -> tuple:
+    """
+    Generate inundation depth raster and classified hazard raster.
+
+    Parameters
+    ----------
+    dem_arr : np.ndarray  Elevation array (NaN where nodata).
+    meta    : dict        Rasterio metadata of the DEM.
+    cfg     : dict        Pipeline config.
+
+    Returns
+    -------
+    depth_arr  : np.ndarray  Inundation depth in metres (0 = not flooded).
+    hazard_arr : np.ndarray  Integer hazard class 1–4  (0 = not flooded).
+    """
+    wse = cfg["flood_level_m"]
+
+    # Cells below the water surface elevation are inundated
+    depth_arr = np.where(
+        (~np.isnan(dem_arr)) & (dem_arr < wse),
+        wse - dem_arr,
+        0.0
+    ).astype(np.float32)
+
+    # Classify inundation depth → hazard class
+    hazard_arr = np.zeros_like(depth_arr, dtype=np.uint8)
+    for cls, (lo, hi) in enumerate(
+            zip(HAZARD_BINS[:-1], HAZARD_BINS[1:]), start=1):
+        mask = (depth_arr > lo) & (depth_arr <= hi)
+        hazard_arr[mask] = cls
+    # Explicitly set deepest class (catches np.inf upper bound)
+    hazard_arr[depth_arr > HAZARD_BINS[-2]] = len(HAZARD_LABELS)
+
+    flooded = int(np.sum(hazard_arr > 0))
+    total   = int(np.sum(~np.isnan(dem_arr)))
+    pct     = flooded / total * 100 if total > 0 else 0
+    print(f"[Stage 4] Flood scenario  : WSE = {wse} m")
+    print(f"[Stage 4] Flooded cells   : {flooded:,} / {total:,}  ({pct:.1f}% of land)")
+
+    for cls, label in enumerate(HAZARD_LABELS, start=1):
+        n = int(np.sum(hazard_arr == cls))
+        print(f"          Class {cls} {label:10s}: {n:,} cells")
+
+    # ── Write depth raster ────────────────────────────────────────────────────
+    depth_path = os.path.join(cfg["out_dir"], "flood_depth.tif")
+    with rasterio.open(depth_path, "w", **meta) as dst:
+        dst.write(depth_arr, 1)
+
+    # ── Write hazard raster ───────────────────────────────────────────────────
+    hazard_meta = meta.copy()
+    hazard_meta.update(dtype="uint8", nodata=0)
+    hazard_path = os.path.join(cfg["out_dir"], "flood_hazard.tif")
+    with rasterio.open(hazard_path, "w", **hazard_meta) as dst:
+        dst.write(hazard_arr, 1)
+
+    print(f"[Stage 4] Saved: {depth_path}")
+    print(f"[Stage 4] Saved: {hazard_path}")
+    return depth_arr, hazard_arr
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 5 — VULNERABILITY ANALYSIS
+# ─────────────────────────────────────────────────────────────────────────────
+"""
+WHAT:  Quantify how exposed population and buildings are to flood hazard
+       within each GN Division.
+
+APPROACH:
+  1. Zonal statistics — % of each GN Division covered by flood cells.
+  2. Area-weighted population exposure.
+  3. Building count within flood extent.
+  4. Classify each GN Division into a vulnerability tier.
+
+VULNERABILITY CLASSES:
+  Very Low : < 10% area flooded
+  Low      : 10 – 25%
+  Moderate : 25 – 50%
+  High     : ≥ 50%
+
+LIBS:  rasterstats (zonal_stats), geopandas (sjoin)
+REPLACES: ArcGIS Intersect + Cross Table in Model Builder
+"""
+
+
+def _flooded_pct(arr: np.ndarray) -> float:
+    """Custom zonal_stats aggregation: % cells with hazard class > 0."""
+    valid = arr[~np.isnan(arr)]
+    if len(valid) == 0:
+        return 0.0
+    return float(np.sum(valid > 0) / len(valid) * 100)
+
+
+def vulnerability_analysis(
+    hazard_path: str,
+    layers: dict,
+    cfg: dict
+) -> gpd.GeoDataFrame:
+    """
+    Compute flood exposure per GN Division and classify vulnerability.
+
+    Parameters
+    ----------
+    hazard_path : str   Path to classified flood hazard GeoTIFF.
+    layers      : dict  Vector layers loaded in Stage 1.
+    cfg         : dict  Pipeline config.
+
+    Returns
+    -------
+    gn_vuln : GeoDataFrame  GN Divisions enriched with vulnerability columns,
+                            or None if GN Division layer was not loaded.
+    """
+    import pandas as pd
+
+    gn        = layers.get("gn_division")
+    pop       = layers.get("population")
+    buildings = layers.get("buildings")
+
+    if gn is None:
+        print("[Stage 5] GN Division layer not found — skipping vulnerability.")
+        return None
+
+    # ── Zonal statistics: mean/max hazard class + % flooded per GN Div ────────
+    print("[Stage 5] Running zonal statistics (this may take a moment) ...")
+    stats = zonal_stats(
+        gn,
+        hazard_path,
+        stats=["mean", "max", "count"],
+        nodata=0,
+        add_stats={"flooded_pct": _flooded_pct}
+    )
+
+    gn_vuln = gn.copy()
+    gn_vuln["mean_hazard"] = [s.get("mean", 0) or 0 for s in stats]
+    gn_vuln["max_hazard"]  = [s.get("max",  0) or 0 for s in stats]
+    gn_vuln["flooded_pct"] = [s.get("flooded_pct", 0) or 0 for s in stats]
+
+    # ── Area-weighted population exposure ─────────────────────────────────────
+    if pop is not None:
+
+        # ── Confirmed column names from your shapefiles ───────────────────────
+        pop_col = "PTOTAL"  # District population  — in pop layer
+        gn_dist_col = "DISTRICT_N"  # District name in GN layer
+        pop_dist_col = "DISTRICT"  # District name in pop layer
+
+        if pop_col in pop.columns:
+
+            # ── Step 1: Compute each GN division's area (metres) ──────────────
+            # EPSG:5235 = Sri Lanka 1999 national projected CRS (unit = metres)
+            gn_proj = gn_vuln.to_crs("EPSG:5235")
+            gn_vuln["gn_area_m2"] = gn_proj.geometry.area
+
+            # ── Step 2: District total area = sum of its GN areas ─────────────
+            district_area = (
+                gn_vuln.groupby(gn_dist_col)["gn_area_m2"]
+                .sum()
+                .reset_index()
+                .rename(columns={"gn_area_m2": "dist_area_m2"})
+            )
+
+            # ── Step 3: Merge district PTOTAL onto GN layer ───────────────────
+            # Join key: GN.DISTRICT_N  ←→  pop.DISTRICT
+            # Drop geometry from pop before merging (avoids geometry conflict)
+            pop_slim = (
+                pop[[pop_dist_col, pop_col]]
+                .drop_duplicates(subset=pop_dist_col)
+            )
+            gn_vuln = gn_vuln.merge(
+                pop_slim,
+                left_on=gn_dist_col,
+                right_on=pop_dist_col,
+                how="left"
+            )
+
+            # ── Step 4: Merge district total area back onto GN layer ──────────
+            gn_vuln = gn_vuln.merge(district_area, on=gn_dist_col, how="left")
+
+            # ── Step 5: Areal interpolation → GN-level estimated population ───
+            # GN pop = District PTOTAL × (GN area / District total area)
+            gn_vuln["pop_density_m2"] = (
+                    gn_vuln[pop_col] / gn_vuln["dist_area_m2"]
+            )
+            gn_vuln["gn_est_pop"] = (
+                    gn_vuln["pop_density_m2"] * gn_vuln["gn_area_m2"]
+            ).round(0)
+
+            # ── Step 6: Exposed population = GN estimated pop × flooded % ─────
+            gn_vuln["exposed_pop"] = (
+                    gn_vuln["gn_est_pop"] * gn_vuln["flooded_pct"] / 100
+            ).round(0)
+
+            # ── Diagnostics ───────────────────────────────────────────────────
+            total_est = gn_vuln["gn_est_pop"].sum()
+            total_district = pop[pop_col].sum()
+            total_exposed = gn_vuln["exposed_pop"].sum()
+            unmatched = gn_vuln[gn_vuln[pop_col].isna()][gn_dist_col].unique()
+
+            print(f"[Stage 5] District PTOTAL (sum)     : {total_district:,.0f}")
+            print(f"[Stage 5] GN estimated pop (sum)    : {total_est:,.0f}  "
+                  f"(should match district total)")
+            print(f"[Stage 5] Total exposed population  : {total_exposed:,.0f}")
+            if len(unmatched) > 0:
+                print(f"[Stage 5] WARNING — {len(unmatched)} unmatched districts: "
+                      f"{list(unmatched)}")
+
+        else:
+            gn_vuln["gn_est_pop"] = np.nan
+            gn_vuln["exposed_pop"] = np.nan
+            print(f"[Stage 5] WARNING — 'PTOTAL' not found in pop layer.")
+            print(f"          Pop columns : {list(pop.columns)}")
+    else:
+        gn_vuln["gn_est_pop"] = np.nan
+        gn_vuln["exposed_pop"] = np.nan
+
+    # ── Count buildings within flood extent ───────────────────────────────────
+    if buildings is not None:
+        print("[Stage 5] Counting buildings in flood zone ...")
+
+        with rasterio.open(hazard_path) as src:
+            flood_mask      = (src.read(1) > 0).astype(np.uint8)
+            flood_transform = src.transform
+            flood_crs       = src.crs
+
+        flood_shapes = [
+            {"type": "Feature", "geometry": geom, "properties": {"val": val}}
+            for geom, val in features.shapes(
+                flood_mask, transform=flood_transform
+            )
+            if val == 1
+        ]
+
+        if flood_shapes:
+            flood_gdf = gpd.GeoDataFrame.from_features(
+                flood_shapes, crs=flood_crs
+            )
+            if str(flood_gdf.crs) != cfg["target_crs"]:
+                flood_gdf = flood_gdf.to_crs(cfg["target_crs"])
+
+            bldg_in_flood = gpd.sjoin(
+                buildings, flood_gdf, how="inner", predicate="intersects"
+            )
+
+            gn_id_col = next(
+                (c for c in ["GN_CODE", "GN_DIV", "GND_N"]
+                 if c in gn.columns and c in buildings.columns), None
+            )
+
+            if gn_id_col and gn_id_col in bldg_in_flood.columns:
+                bldg_count = (
+                    bldg_in_flood.groupby(gn_id_col)
+                    .size()
+                    .reset_index(name="bldg_flood_count")
+                )
+                gn_vuln = gn_vuln.merge(
+                    bldg_count, on=gn_id_col, how="left"
+                )
+            else:
+                gn_vuln["bldg_flood_count"] = len(bldg_in_flood)
+
+            gn_vuln["bldg_flood_count"] = (
+                gn_vuln["bldg_flood_count"].fillna(0).astype(int)
+            )
+            print(f"[Stage 5] Total buildings in flood zone: "
+                  f"{gn_vuln['bldg_flood_count'].sum():,}")
+        else:
+            gn_vuln["bldg_flood_count"] = 0
+            print("[Stage 5] No flooded cells found — building count = 0.")
+    else:
+        gn_vuln["bldg_flood_count"] = 0
+
+    # ── Classify vulnerability ────────────────────────────────────────────────
+    gn_vuln["vuln_class"] = pd.cut(
+        gn_vuln["flooded_pct"],
+        bins=VULN_BINS,
+        labels=VULN_LABELS,
+        right=True,
+        include_lowest=True
+    ).astype(str)
+
+    # ── Save output ───────────────────────────────────────────────────────────
+    out_path = os.path.join(cfg["out_dir"], "vulnerability.gpkg")
+    gn_vuln.to_file(out_path, driver="GPKG")
+    print(f"[Stage 5] Vulnerability layer saved: {out_path}")
+
+    for label in VULN_LABELS:
+        n = int((gn_vuln["vuln_class"] == label).sum())
+        print(f"          {label:10s}: {n:,} GN Divisions")
+
+    return gn_vuln
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 6 — FLOOD RISK MAPPING (WEIGHTED OVERLAY)
+# ─────────────────────────────────────────────────────────────────────────────
+"""
+WHAT:  Combine hazard (60%) and vulnerability (40%) into a Flood Risk score.
+
+FORMULA:
+  Risk Score = (0.60 × Hazard_Class) + (0.40 × Vulnerability_Class)
+
+RISK CLASSES:
+  1 — Very Low   (score 0   – 1.8)
+  2 — Low        (score 1.8 – 2.6)
+  3 — Moderate   (score 2.6 – 3.4)
+  4 — High       (score 3.4 – 4.2)
+  5 — Very High  (score 4.2 – 5.0)
+
+REPLACES: ArcGIS Weighted Overlay tool (Spatial Analyst)
+"""
+
+
+def flood_risk_mapping(
+    hazard_path: str,
+    gn_vuln: gpd.GeoDataFrame,
+    meta: dict,
+    cfg: dict
+) -> np.ndarray:
+    """
+    Produce a classified Flood Risk raster via weighted overlay.
+
+    Parameters
+    ----------
+    hazard_path : str            Path to flood hazard GeoTIFF.
+    gn_vuln     : GeoDataFrame   Vulnerability layer from Stage 5.
+    meta        : dict           Rasterio metadata template.
+    cfg         : dict           Pipeline config.
+
+    Returns
+    -------
+    risk_arr : np.ndarray  Risk class raster (1–5, 0 = outside study area).
+    """
+    # ── Load hazard raster ────────────────────────────────────────────────────
+    with rasterio.open(hazard_path) as src:
+        hazard_arr  = src.read(1).astype(np.float32)
+        h_transform = src.transform
+        h_shape     = src.shape
+        h_crs       = src.crs
+
+    # ── Rasterise vulnerability classes ──────────────────────────────────────
+    vuln_num_map = {"Very Low": 1, "Low": 2, "Moderate": 3, "High": 4}
+    gn_copy = gn_vuln.copy()
+    gn_copy["vuln_num"] = gn_copy["vuln_class"].map(vuln_num_map).fillna(0)
+
+    # Reproject vulnerability to match hazard raster CRS if needed
+    if str(gn_copy.crs) != str(h_crs):
+        gn_copy = gn_copy.to_crs(h_crs)
+
+    vuln_shapes = [
+        (geom, val)
+        for geom, val in zip(gn_copy.geometry, gn_copy["vuln_num"])
+        if geom is not None
+    ]
+
+    if vuln_shapes:
+        vuln_raster = features.rasterize(
+            vuln_shapes,
+            out_shape=h_shape,
+            transform=h_transform,
+            fill=0,
+            dtype=np.float32
+        )
+    else:
+        vuln_raster = np.zeros(h_shape, dtype=np.float32)
+
+    # ── Weighted overlay ──────────────────────────────────────────────────────
+    risk_score = (HAZARD_WEIGHT * hazard_arr) + (VULN_WEIGHT * vuln_raster)
+
+    risk_arr = np.zeros(h_shape, dtype=np.uint8)
+    risk_arr[(risk_score > 0)   & (risk_score <= 1.8)] = 1
+    risk_arr[(risk_score > 1.8) & (risk_score <= 2.6)] = 2
+    risk_arr[(risk_score > 2.6) & (risk_score <= 3.4)] = 3
+    risk_arr[(risk_score > 3.4) & (risk_score <= 4.2)] = 4
+    risk_arr[risk_score > 4.2]                         = 5
+
+    # ── Save risk raster ──────────────────────────────────────────────────────
+    risk_meta = meta.copy()
+    risk_meta.update(dtype="uint8", nodata=0)
+    risk_path = os.path.join(cfg["out_dir"], "flood_risk.tif")
+    with rasterio.open(risk_path, "w", **risk_meta) as dst:
+        dst.write(risk_arr, 1)
+
+    print(f"[Stage 6] Flood Risk Map saved: {risk_path}")
+    for i, label in enumerate(RISK_LABELS, start=1):
+        print(f"          Class {i} — {label:10s}: {np.sum(risk_arr == i):,} cells")
+
+    return risk_arr
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 7 — VISUALIZATION & EXPORT
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _add_north_arrow(ax):
+    """Add a north-arrow annotation to a matplotlib Axes object."""
+    ax.annotate(
+        "N",
+        xy=(0.97, 0.15), xycoords="axes fraction",
+        ha="center", va="bottom",
+        fontsize=13, fontweight="bold",
+        arrowprops=dict(arrowstyle="->", lw=1.5),
+        xytext=(0.97, 0.08)
+    )
+
+
+def _add_scalebar(ax):
+    """Add a simple scale bar annotation to a matplotlib Axes object."""
+    x0, y0 = 0.05, 0.05
+    ax.annotate(
+        "", xy=(x0 + 0.1, y0),
+        xytext=(x0, y0),
+        xycoords="axes fraction",
+        arrowprops=dict(arrowstyle="-", lw=2, color="black")
+    )
+    ax.text(
+        x0 + 0.05, y0 + 0.015,
+        "~111 km",
+        ha="center", va="bottom",
+        transform=ax.transAxes,
+        fontsize=8
+    )
+
+
+def plot_dem(dem_arr: np.ndarray, cfg: dict):
+    """Render a terrain overview map of the Sri Lanka DEM."""
+    fig, ax = plt.subplots(figsize=(10, 12))
+    im = ax.imshow(
+        dem_arr,
+        cmap="terrain",
+        interpolation="bilinear",
+        vmin=0,
+        vmax=np.nanpercentile(dem_arr, 99)
+    )
+    plt.colorbar(im, ax=ax, fraction=0.03, pad=0.04, label="Elevation (m)")
+    ax.set_title("Digital Elevation Model — Sri Lanka",
+                 fontsize=14, fontweight="bold")
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    _add_north_arrow(ax)
+
+    out = os.path.join(cfg["out_dir"], "map_dem.png")
+    plt.savefig(out, dpi=200, bbox_inches="tight")
+    plt.close()
+    print(f"[Stage 7] Saved: {out}")
+
+
+def plot_hazard_map(hazard_arr: np.ndarray, meta: dict, cfg: dict):
+    """Render the Flood Hazard Map (4-class scheme)."""
+    # Class 0 = not flooded → white; classes 1–4 → HAZARD_COLORS
+    cmap = ListedColormap(["white"] + HAZARD_COLORS)
+    norm = BoundaryNorm([0, 0.5, 1.5, 2.5, 3.5, 4.5], cmap.N)
+
+    fig, ax = plt.subplots(figsize=(10, 12))
+    ax.imshow(hazard_arr, cmap=cmap, norm=norm, interpolation="nearest")
+
+    legend_handles = [
+        mpatches.Patch(color=HAZARD_COLORS[i], label=HAZARD_LABELS[i])
+        for i in range(len(HAZARD_LABELS))
+    ]
+    ax.legend(handles=legend_handles, loc="lower right",
+              title="Hazard Level", fontsize=9)
+    ax.set_title(
+        f"Flood Hazard Map — Sri Lanka\n(WSE = {cfg['flood_level_m']} m)",
+        fontsize=14, fontweight="bold"
+    )
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    _add_north_arrow(ax)
+    _add_scalebar(ax)
+
+    out = os.path.join(cfg["out_dir"], "map_flood_hazard.png")
+    plt.savefig(out, dpi=200, bbox_inches="tight")
+    plt.close()
+    print(f"[Stage 7] Saved: {out}")
+
+
+def plot_vulnerability_map(gn_vuln: gpd.GeoDataFrame, cfg: dict):
+    """Render the Vulnerability Map coloured by vulnerability class."""
+    if gn_vuln is None:
+        print("[Stage 7] Skipping vulnerability map — no data.")
+        return
+
+    color_map = dict(zip(VULN_LABELS, VULN_COLORS))
+
+    fig, ax = plt.subplots(figsize=(10, 12))
+
+    for label in VULN_LABELS:
+        subset = gn_vuln[gn_vuln["vuln_class"] == label]
+        if not subset.empty:
+            subset.plot(
+                ax=ax,
+                color=color_map[label],
+                edgecolor="white",
+                linewidth=0.2,
+                label=label
+            )
+
+    unclassified = gn_vuln[~gn_vuln["vuln_class"].isin(VULN_LABELS)]
+    if not unclassified.empty:
+        unclassified.plot(
+            ax=ax, color="#CCCCCC", edgecolor="white",
+            linewidth=0.2, label="No Data"
+        )
+
+    legend_handles = [
+        mpatches.Patch(color=VULN_COLORS[i], label=VULN_LABELS[i])
+        for i in range(len(VULN_LABELS))
+    ] + [mpatches.Patch(color="#CCCCCC", label="No Data")]
+    ax.legend(handles=legend_handles, loc="lower right",
+              title="Vulnerability Level", fontsize=9)
+    ax.set_title("Vulnerability Map — Sri Lanka",
+                 fontsize=14, fontweight="bold")
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    _add_north_arrow(ax)
+
+    out = os.path.join(cfg["out_dir"], "map_vulnerability.png")
+    plt.savefig(out, dpi=200, bbox_inches="tight")
+    plt.close()
+    print(f"[Stage 7] Saved: {out}")
+
+
+def plot_risk_map(risk_arr: np.ndarray, meta: dict, cfg: dict):
+    """Render the Flood Risk Map (5-class scheme)."""
+    cmap = ListedColormap(["white"] + RISK_COLORS)
+    norm = BoundaryNorm(list(range(7)), cmap.N)
+
+    fig, ax = plt.subplots(figsize=(10, 12))
+    ax.imshow(risk_arr, cmap=cmap, norm=norm, interpolation="nearest")
+
+    legend_handles = [
+        mpatches.Patch(color=RISK_COLORS[i], label=RISK_LABELS[i])
+        for i in range(len(RISK_LABELS))
+    ]
+    ax.legend(handles=legend_handles, loc="lower right",
+              title="Flood Risk Level", fontsize=9)
+    ax.set_title("Flood Risk Map — Sri Lanka",
+                 fontsize=14, fontweight="bold")
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    _add_north_arrow(ax)
+    _add_scalebar(ax)
+
+    out = os.path.join(cfg["out_dir"], "map_flood_risk.png")
+    plt.savefig(out, dpi=200, bbox_inches="tight")
+    plt.close()
+    print(f"[Stage 7] Saved: {out}")
+
+
+def plot_summary_statistics(
+    dem_arr: np.ndarray,
+    hazard_arr: np.ndarray,
+    risk_arr: np.ndarray,
+    gn_vuln: gpd.GeoDataFrame,
+    cfg: dict
+):
+    """
+    Four-panel summary figure:
+      Top-left  : DEM elevation histogram
+      Top-right : Hazard class cell distribution
+      Bot-left  : Risk class cell distribution
+      Bot-right : Exposed population by vulnerability class
+    """
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle("Flood Risk Assessment Summary — Sri Lanka",
+                 fontsize=15, fontweight="bold")
+
+    # ── DEM histogram ─────────────────────────────────────────────────────────
+    ax = axes[0, 0]
+    valid_elev = dem_arr[~np.isnan(dem_arr)].ravel()
+    ax.hist(valid_elev, bins=80, color="#4A90D9", edgecolor="none", alpha=0.85)
+    ax.axvline(cfg["flood_level_m"], color="red", lw=1.5,
+               linestyle="--", label=f"WSE = {cfg['flood_level_m']} m")
+    ax.set_xlabel("Elevation (m)")
+    ax.set_ylabel("Cell count")
+    ax.set_title("DEM Elevation Distribution")
+    ax.legend(fontsize=9)
+
+    # ── Hazard class bar chart ────────────────────────────────────────────────
+    ax = axes[0, 1]
+    hazard_counts = [int(np.sum(hazard_arr == c))
+                     for c in range(1, len(HAZARD_LABELS) + 1)]
+    ax.bar(HAZARD_LABELS, hazard_counts,
+           color=HAZARD_COLORS, edgecolor="white")
+    ax.set_xlabel("Hazard Class")
+    ax.set_ylabel("Cell count")
+    ax.set_title("Flood Hazard — Cell Distribution")
+    ax.tick_params(axis="x", rotation=15)
+
+    # ── Risk class bar chart ──────────────────────────────────────────────────
+    ax = axes[1, 0]
+    risk_counts = [int(np.sum(risk_arr == c))
+                   for c in range(1, len(RISK_LABELS) + 1)]
+    ax.bar(RISK_LABELS, risk_counts,
+           color=RISK_COLORS, edgecolor="white")
+    ax.set_xlabel("Risk Class")
+    ax.set_ylabel("Cell count")
+    ax.set_title("Flood Risk — Cell Distribution")
+    ax.tick_params(axis="x", rotation=15)
+
+    # ── Exposed population by vulnerability class ─────────────────────────────
+    ax = axes[1, 1]
+    if gn_vuln is not None and "exposed_pop" in gn_vuln.columns:
+        pop_by_class = (
+            gn_vuln.groupby("vuln_class")["exposed_pop"]
+            .sum()
+            .reindex(VULN_LABELS, fill_value=0)
+        )
+        ax.bar(pop_by_class.index, pop_by_class.values,
+               color=VULN_COLORS, edgecolor="white")
+        ax.set_xlabel("Vulnerability Class")
+        ax.set_ylabel("Exposed Population")
+        ax.set_title("Exposed Population by Vulnerability Class")
+        ax.tick_params(axis="x", rotation=15)
+    else:
+        ax.text(0.5, 0.5, "Population data\nnot available",
+                ha="center", va="center",
+                transform=ax.transAxes, fontsize=12)
+        ax.set_title("Exposed Population")
+
+    plt.tight_layout()
+    out = os.path.join(cfg["out_dir"], "summary_statistics.png")
+    plt.savefig(out, dpi=200, bbox_inches="tight")
+    plt.close()
+    print(f"[Stage 7] Saved: {out}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN PIPELINE ORCHESTRATOR
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def run_pipeline(cfg: dict = CFG):
+    """Execute the full Sri Lanka flood risk assessment pipeline end-to-end."""
+    print("=" * 65)
+    print(" FLOOD RISK ASSESSMENT PIPELINE — SRI LANKA (FULL ISLAND)")
+    print("=" * 65)
+
+    # ── Stage 1: Load & clip data ─────────────────────────────────────────────
+    dem_arr, transform, crs, nodata, meta = load_and_clip_dem(cfg)
+    layers = load_vector_layers(cfg)
+
+    # Save clipped DEM as GeoTIFF so pysheds can read it from disk
+    clipped_dem_path = os.path.join(cfg["out_dir"], "dem_clipped.tif")
+    nan_safe = np.where(np.isnan(dem_arr), -9999, dem_arr)
+    with rasterio.open(clipped_dem_path, "w", **meta) as dst:
+        dst.write(nan_safe.astype(np.float32), 1)
+    print(f"[Stage 1] Clipped DEM saved: {clipped_dem_path}")
+
+    # ── Stage 2: Condition DEM ────────────────────────────────────────────────
+    grid, conditioned_dem = preprocess_dem(clipped_dem_path, cfg)
+
+    # ── Stage 3: Watershed delineation ───────────────────────────────────────
+    watershed = delineate_watershed(grid, conditioned_dem, cfg)
+
+    # ── Stage 4: Flood hazard map ─────────────────────────────────────────────
+    depth_arr, hazard_arr = generate_flood_hazard_map(dem_arr, meta, cfg)
+    hazard_path = os.path.join(cfg["out_dir"], "flood_hazard.tif")
+
+    # ── Stage 5: Vulnerability analysis ──────────────────────────────────────
+    gn_vuln = vulnerability_analysis(hazard_path, layers, cfg)
+
+    # ── Stage 6: Risk mapping ─────────────────────────────────────────────────
+    if gn_vuln is not None:
+        risk_arr = flood_risk_mapping(hazard_path, gn_vuln, meta, cfg)
+    else:
+        print("[Stage 6] No vulnerability layer — risk derived from hazard only.")
+        risk_arr = hazard_arr.copy().astype(np.uint8)
+        risk_meta = meta.copy()
+        risk_meta.update(dtype="uint8", nodata=0)
+        risk_path = os.path.join(cfg["out_dir"], "flood_risk.tif")
+        with rasterio.open(risk_path, "w", **risk_meta) as dst:
+            dst.write(risk_arr, 1)
+        print(f"[Stage 6] Hazard-only risk raster saved: {risk_path}")
+
+    # ── Stage 7: Visualize & export ───────────────────────────────────────────
+    plot_dem(dem_arr, cfg)
+    plot_hazard_map(hazard_arr, meta, cfg)
+    plot_vulnerability_map(gn_vuln, cfg)
+    plot_risk_map(risk_arr, meta, cfg)
+    plot_summary_statistics(dem_arr, hazard_arr, risk_arr, gn_vuln, cfg)
+
+    # ── Final summary ─────────────────────────────────────────────────────────
+    print("\n" + "=" * 65)
+    print(" PIPELINE COMPLETE — SRI LANKA FLOOD RISK ASSESSMENT")
+    print("=" * 65)
+    print(f" Output directory : {os.path.abspath(cfg['out_dir'])}")
+    print(f" Output files:")
+    for f in sorted(os.listdir(cfg["out_dir"])):
+        fpath = os.path.join(cfg["out_dir"], f)
+        size  = os.path.getsize(fpath) / (1024 * 1024)
+        print(f"   {f:<35s}  {size:6.1f} MB")
+    print("=" * 65)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    run_pipeline(CFG)
